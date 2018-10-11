@@ -47,6 +47,7 @@
 -export([info/1, attrs/1]).
 -export([stats/1]).
 -export([resume/2, discard/2]).
+-export([update_expiry_interval/2, update_misc/2]).
 -export([subscribe/2, subscribe/4]).
 -export([publish/3]).
 -export([puback/2, puback/3]).
@@ -126,7 +127,7 @@
           await_rel_timer :: reference() | undefined,
 
           %% Session Expiry Interval
-          expiry_interval = 7200000 :: timeout(),
+          expiry_interval = 7200 :: timeout(),
 
           %% Expired Timer
           expiry_timer :: reference() | undefined,
@@ -144,7 +145,9 @@
           enqueue_stats = 0,
 
           %% Created at
-          created_at :: erlang:timestamp()
+          created_at :: erlang:timestamp(),
+
+          topic_alias_maximum :: pos_integer()
          }).
 
 -type(spid() :: pid()).
@@ -313,6 +316,13 @@ resume(SPid, ConnPid) ->
 discard(SPid, ByPid) ->
     gen_server:call(SPid, {discard, ByPid}, infinity).
 
+-spec(update_expiry_interval(spid(), timeout()) -> ok).
+update_expiry_interval(SPid, Interval) ->
+    gen_server:cast(SPid, {expiry_interval, Interval}).
+
+update_misc(SPid, Misc) ->
+    gen_server:cast(SPid, {update_misc, Misc}).
+
 -spec(close(spid()) -> ok).
 close(SPid) ->
     gen_server:call(SPid, close, infinity).
@@ -321,46 +331,47 @@ close(SPid) ->
 %% gen_server callbacks
 %%------------------------------------------------------------------------------
 
-init([Parent, #{zone        := Zone,
-                client_id   := ClientId,
-                username    := Username,
-                conn_pid    := ConnPid,
-                clean_start := CleanStart,
-                conn_props  := ConnProps}]) ->
+init([Parent, #{zone                := Zone,
+                client_id           := ClientId,
+                username            := Username,
+                conn_pid            := ConnPid,
+                clean_start         := CleanStart,
+                expiry_interval     := ExpiryInterval,
+                max_inflight        := MaxInflight,
+                topic_alias_maximum := TopicAliasMaximum}]) ->
     process_flag(trap_exit, true),
     true = link(ConnPid),
-    MaxInflight = get_env(Zone, max_inflight),
     IdleTimout = get_env(Zone, idle_timeout, 30000),
-    State = #state{idle_timeout      = IdleTimout,
-                   clean_start       = CleanStart,
-                   binding           = binding(ConnPid),
-                   client_id         = ClientId,
-                   username          = Username,
-                   conn_pid          = ConnPid,
-                   subscriptions     = #{},
-                   max_subscriptions = get_env(Zone, max_subscriptions, 0),
-                   upgrade_qos       = get_env(Zone, upgrade_qos, false),
-                   inflight          = emqx_inflight:new(MaxInflight),
-                   mqueue            = init_mqueue(Zone),
-                   retry_interval    = get_env(Zone, retry_interval, 0),
-                   awaiting_rel      = #{},
-                   await_rel_timeout = get_env(Zone, await_rel_timeout),
-                   max_awaiting_rel  = get_env(Zone, max_awaiting_rel),
-                   expiry_interval   = expire_interval(Zone, ConnProps),
-                   enable_stats      = get_env(Zone, enable_stats, true),
-                   deliver_stats     = 0,
-                   enqueue_stats     = 0,
-                   created_at        = os:timestamp()},
+    State = #state{idle_timeout        = IdleTimout,
+                   clean_start         = CleanStart,
+                   binding             = binding(ConnPid),
+                   client_id           = ClientId,
+                   username            = Username,
+                   conn_pid            = ConnPid,
+                   subscriptions       = #{},
+                   max_subscriptions   = get_env(Zone, max_subscriptions, 0),
+                   upgrade_qos         = get_env(Zone, upgrade_qos, false),
+                   inflight            = emqx_inflight:new(MaxInflight),
+                   mqueue              = init_mqueue(Zone),
+                   retry_interval      = get_env(Zone, retry_interval, 0),
+                   awaiting_rel        = #{},
+                   await_rel_timeout   = get_env(Zone, await_rel_timeout),
+                   max_awaiting_rel    = get_env(Zone, max_awaiting_rel),
+                   expiry_interval     = ExpiryInterval,
+                   enable_stats        = get_env(Zone, enable_stats, true),
+                   deliver_stats       = 0,
+                   enqueue_stats       = 0,
+                   created_at          = os:timestamp(),
+                   topic_alias_maximum = TopicAliasMaximum
+                  },
     emqx_sm:register_session(ClientId, attrs(State)),
     emqx_sm:set_session_stats(ClientId, stats(State)),
     emqx_hooks:run('session.created', [#{client_id => ClientId}, info(State)]),
+    GcPolicy = emqx_zone:get_env(Zone, force_gc_policy, false),
+    ok = emqx_gc:init(GcPolicy),
+    ok = emqx_misc:init_proc_mng_policy(Zone),
     ok = proc_lib:init_ack(Parent, {ok, self()}),
     gen_server:enter_loop(?MODULE, [{hibernate_after, IdleTimout}], State).
-
-expire_interval(_Zone, #{'Session-Expiry-Interval' := I}) ->
-    I * 1000;
-expire_interval(Zone, _ConnProps) -> %% Maybe v3.1.1
-    get_env(Zone, session_expiry_interval, 0).
 
 init_mqueue(Zone) ->
     emqx_mqueue:init(#{type => get_env(Zone, mqueue_type, simple),
@@ -536,6 +547,13 @@ handle_cast({resume, ConnPid}, State = #state{client_id       = ClientId,
     %% Replay delivery and Dequeue pending messages
     noreply(dequeue(retry_delivery(true, State1)));
 
+handle_cast({expiry_interval, Interval}, State) ->
+    {noreply, State#state{expiry_interval = Interval}};
+
+handle_cast({update_misc, #{max_inflight := MaxInflight, topic_alias_maximum := TopicAliasMaximum}}, State) ->
+    {noreply, State#state{inflight            = emqx_inflight:update_size(MaxInflight, State#state.inflight),
+                          topic_alias_maximum = TopicAliasMaximum}};
+
 handle_cast(Msg, State) ->
     emqx_logger:error("[Session] unexpected cast: ~p", [Msg]),
     {noreply, State}.
@@ -547,15 +565,22 @@ handle_info({dispatch, Topic, Msgs}, State) when is_list(Msgs) ->
                           end, State, Msgs)};
 
 %% Dispatch message
-handle_info({dispatch, Topic, Msg}, State = #state{subscriptions = SubMap}) when is_record(Msg, message) ->
-    noreply(case maps:find(Topic, SubMap) of
-                {ok, #{nl := Nl, qos := QoS, rap := Rap, subid := SubId}} ->
-                    run_dispatch_steps([{nl, Nl}, {qos, QoS}, {rap, Rap}, {subid, SubId}], Msg, State);
-                {ok, #{nl := Nl, qos := QoS, rap := Rap}} ->
-                    run_dispatch_steps([{nl, Nl}, {qos, QoS}, {rap, Rap}], Msg, State);
-                error ->
-                    dispatch(emqx_message:unset_flag(dup, Msg), State)
-            end);
+handle_info({dispatch, Topic, Msg = #message{headers = Headers}}, 
+            State = #state{subscriptions = SubMap, topic_alias_maximum = TopicAliasMaximum}) when is_record(Msg, message) ->
+    TopicAlias = maps:get('Topic-Alias', Headers, undefined),
+    if 
+        TopicAlias =:= undefined orelse TopicAlias =< TopicAliasMaximum ->
+            noreply(case maps:find(Topic, SubMap) of
+                        {ok, #{nl := Nl, qos := QoS, rap := Rap, subid := SubId}} ->
+                            run_dispatch_steps([{nl, Nl}, {qos, QoS}, {rap, Rap}, {subid, SubId}], Msg, State);
+                        {ok, #{nl := Nl, qos := QoS, rap := Rap}} ->
+                            run_dispatch_steps([{nl, Nl}, {qos, QoS}, {rap, Rap}], Msg, State);
+                        error ->
+                            dispatch(emqx_message:unset_flag(dup, Msg), State)
+                    end);
+        true ->
+            noreply(State)
+    end;
 
 %% Do nothing if the client has been disconnected.
 handle_info({timeout, Timer, retry_delivery}, State = #state{conn_pid = undefined, retry_timer = Timer}) ->
@@ -567,21 +592,30 @@ handle_info({timeout, Timer, retry_delivery}, State = #state{retry_timer = Timer
 handle_info({timeout, Timer, check_awaiting_rel}, State = #state{await_rel_timer = Timer}) ->
     noreply(expire_awaiting_rel(State#state{await_rel_timer = undefined}));
 
-handle_info({timeout, Timer, emit_stats}, State = #state{client_id = ClientId, stats_timer = Timer}) ->
+handle_info({timeout, Timer, emit_stats},
+            State = #state{client_id = ClientId,
+                           stats_timer = Timer}) ->
     _ = emqx_sm:set_session_stats(ClientId, stats(State)),
-    {noreply, State#state{stats_timer = undefined}, hibernate};
-
+    NewState = State#state{stats_timer = undefined},
+    Limits = erlang:get(force_shutdown_policy),
+    case emqx_misc:conn_proc_mng_policy(Limits) of
+        continue ->
+            {noreply, NewState};
+        hibernate ->
+            ok = emqx_gc:reset(), %% going to hibernate, reset gc stats
+            {noreply, NewState, hibernate};
+        {shutdown, Reason} ->
+            ?LOG(warning, "shutdown due to ~p", [Reason], NewState),
+            shutdown(Reason, NewState)
+    end;
 handle_info({timeout, Timer, expired}, State = #state{expiry_timer = Timer}) ->
     ?LOG(info, "expired, shutdown now:(", [], State),
     shutdown(expired, State);
 
-handle_info({'EXIT', ConnPid, Reason}, State = #state{clean_start = true, conn_pid = ConnPid}) ->
-    {stop, Reason, State#state{conn_pid = undefined}};
-
 handle_info({'EXIT', ConnPid, Reason}, State = #state{expiry_interval = 0, conn_pid = ConnPid}) ->
     {stop, Reason, State#state{conn_pid = undefined}};
 
-handle_info({'EXIT', ConnPid, _Reason}, State = #state{clean_start = false, conn_pid = ConnPid}) ->
+handle_info({'EXIT', ConnPid, _Reason}, State = #state{conn_pid = ConnPid}) ->
     {noreply, ensure_expire_timer(State#state{conn_pid = undefined})};
 
 handle_info({'EXIT', OldPid, _Reason}, State = #state{old_conn_pid = OldPid}) ->
@@ -744,21 +778,22 @@ dispatch(Msg, State = #state{client_id = ClientId, conn_pid = undefined}) ->
     end;
 
 %% Deliver qos0 message directly to client
-dispatch(Msg = #message{qos = ?QOS0}, State) ->
+dispatch(Msg = #message{qos = ?QOS0} = Msg, State) ->
     deliver(undefined, Msg, State),
-    inc_stats(deliver, State);
+    inc_stats(deliver, Msg, State);
 
-dispatch(Msg = #message{qos = QoS}, State = #state{next_pkt_id = PacketId, inflight = Inflight})
+dispatch(Msg = #message{qos = QoS} = Msg,
+         State = #state{next_pkt_id = PacketId, inflight = Inflight})
   when QoS =:= ?QOS1 orelse QoS =:= ?QOS2 ->
     case emqx_inflight:is_full(Inflight) of
         true -> enqueue_msg(Msg, State);
         false ->
             deliver(PacketId, Msg, State),
-            await(PacketId, Msg, inc_stats(deliver, next_pkt_id(State)))
+            await(PacketId, Msg, inc_stats(deliver, Msg, next_pkt_id(State)))
     end.
 
 enqueue_msg(Msg, State = #state{mqueue = Q}) ->
-    inc_stats(enqueue, State#state{mqueue = emqx_mqueue:in(Msg, Q)}).
+    inc_stats(enqueue, Msg, State#state{mqueue = emqx_mqueue:in(Msg, Q)}).
 
 %%------------------------------------------------------------------------------
 %% Deliver
@@ -775,7 +810,7 @@ redeliver({pubrel, PacketId}, #state{conn_pid = ConnPid}) ->
 deliver(PacketId, Msg, #state{conn_pid = ConnPid, binding = local}) ->
     ConnPid ! {deliver, {publish, PacketId, Msg}};
 deliver(PacketId, Msg, #state{conn_pid = ConnPid, binding = remote}) ->
-    emqx_rpc:cast(node(ConnPid), erlang, send, [ConnPid, {deliver, PacketId, Msg}]).
+    emqx_rpc:cast(node(ConnPid), erlang, send, [ConnPid, {deliver, {publish, PacketId, Msg}}]).
 
 %%------------------------------------------------------------------------------
 %% Awaiting ACK for QoS1/QoS2 Messages
@@ -789,7 +824,7 @@ await(PacketId, Msg, State = #state{inflight = Inflight}) ->
 acked(puback, PacketId, State = #state{client_id = ClientId, inflight  = Inflight}) ->
     case emqx_inflight:lookup(PacketId, Inflight) of
         {value, {publish, {_, Msg}, _Ts}} ->
-            emqx_hooks:run('message.acked', [#{client_id =>ClientId}], Msg),
+            emqx_hooks:run('message.acked', [#{client_id => ClientId}], Msg),
             State#state{inflight = emqx_inflight:delete(PacketId, Inflight)};
         none ->
             ?LOG(warning, "Duplicated PUBACK PacketId ~w", [PacketId], State),
@@ -799,7 +834,7 @@ acked(puback, PacketId, State = #state{client_id = ClientId, inflight  = Infligh
 acked(pubrec, PacketId, State = #state{client_id = ClientId, inflight  = Inflight}) ->
     case emqx_inflight:lookup(PacketId, Inflight) of
         {value, {publish, {_, Msg}, _Ts}} ->
-            emqx_hooks:run('message.acked', [ClientId], Msg),
+            emqx_hooks:run('message.acked', [#{client_id => ClientId}], Msg),
             State#state{inflight = emqx_inflight:update(PacketId, {pubrel, PacketId, os:timestamp()}, Inflight)};
         {value, {pubrel, PacketId, _Ts}} ->
             ?LOG(warning, "Duplicated PUBREC PacketId ~w", [PacketId], State),
@@ -859,8 +894,8 @@ ensure_retry_timer(Interval, State = #state{retry_timer = undefined}) ->
 ensure_retry_timer(_Timeout, State) ->
     State.
 
-ensure_expire_timer(State = #state{expiry_interval = Interval}) when Interval > 0 ->
-    State#state{expiry_timer = emqx_misc:start_timer(Interval, expired)};
+ensure_expire_timer(State = #state{expiry_interval = Interval}) when Interval > 0 andalso Interval =/= 16#ffffffff ->
+    State#state{expiry_timer = emqx_misc:start_timer(Interval * 1000, expired)};
 ensure_expire_timer(State) ->
     State.
 
@@ -882,10 +917,18 @@ next_pkt_id(State = #state{next_pkt_id = Id}) ->
 %%------------------------------------------------------------------------------
 %% Inc stats
 
-inc_stats(deliver, State = #state{deliver_stats = I}) ->
+inc_stats(deliver, Msg, State = #state{deliver_stats = I}) ->
+    MsgSize = msg_size(Msg),
+    ok = emqx_gc:inc(1, MsgSize),
     State#state{deliver_stats = I + 1};
-inc_stats(enqueue, State = #state{enqueue_stats = I}) ->
+inc_stats(enqueue, _Msg, State = #state{enqueue_stats = I}) ->
     State#state{enqueue_stats = I + 1}.
+
+%% Take only the payload size into account, add other fields if necessary
+msg_size(#message{payload = Payload}) -> payload_size(Payload).
+
+%% Payload should be binary(), but not 100% sure. Need dialyzer!
+payload_size(Payload) -> erlang:iolist_size(Payload).
 
 %%------------------------------------------------------------------------------
 %% Helper functions
@@ -902,5 +945,3 @@ noreply(State) ->
 shutdown(Reason, State) ->
     {stop, {shutdown, Reason}, State}.
 
-%% TODO: GC Policy and Shutdown Policy
-%% maybe_gc(State) -> State.

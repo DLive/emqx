@@ -676,14 +676,14 @@ end}.
   {datatype, {enum, [allow, deny]}}
 ]}.
 
-%% @doc Enable Ban.
-{mapping, "zone.$name.enable_ban", "emqx.zones", [
+%% @doc Enable ACL check.
+{mapping, "zone.$name.enable_acl", "emqx.zones", [
   {default, off},
   {datatype, flag}
 ]}.
 
-%% @doc Enable ACL check.
-{mapping, "zone.$name.enable_acl", "emqx.zones", [
+%% @doc Enable Ban.
+{mapping, "zone.$name.enable_ban", "emqx.zones", [
   {default, off},
   {datatype, flag}
 ]}.
@@ -696,7 +696,6 @@ end}.
 
 %% @doc Publish limit of the MQTT connections.
 {mapping, "zone.$name.publish_limit", "emqx.zones", [
-  {default, undefined},
   {datatype, string}
 ]}.
 
@@ -797,7 +796,7 @@ end}.
 %% @doc Session Expiry Interval
 {mapping, "zone.$name.session_expiry_interval", "emqx.zones", [
   {default, "2h"},
-  {datatype, {duration, ms}}
+  {datatype, {duration, s}}
 ]}.
 
 %% @doc Type: simple | priority
@@ -824,6 +823,28 @@ end}.
   {datatype, {enum, [true, false]}}
 ]}.
 
+%% @doc Force connection/session process GC after this number of
+%% messages | bytes passed through.
+%% Numbers delimited by `|'. Zero or negative is to disable.
+{mapping, "zone.$name.force_gc_policy", "emqx.zones", [
+   {default, "0 | 0MB"},
+   {datatype, string}
+ ]}.
+
+%% @doc Max message queue length and total heap size to force shutdown
+%% connection/session process.
+%% Message queue here is the Erlang process mailbox, but not the number
+%% of queued MQTT messages of QoS 1 and 2.
+%% Zero or negative is to disable.
+{mapping, "zone.$name.force_shutdown_policy", "emqx.zones", [
+  {default, "0 | 0MB"},
+  {datatype, string}
+]}.
+
+{mapping, "zone.$name.mountpoint", "emqx.zones", [
+  {datatype, string}
+]}.
+
 {translation, "emqx.zones", fun(Conf) ->
   Mapping = fun("retain_available", Val) ->
                     {mqtt_retain_available, Val};
@@ -831,6 +852,35 @@ end}.
                     {mqtt_wildcard_subscription, Val};
                ("shared_subscription", Val) ->
                     {mqtt_shared_subscription, Val};
+               ("publish_limit", Val) ->
+                    [Limit, Duration] = string:tokens(Val, ", "),
+                    PubLimit = case cuttlefish_duration:parse(Duration, s) of
+                                   Secs when is_integer(Secs) ->
+                                       {list_to_integer(Limit) / Secs, list_to_integer(Limit)};
+                                   {error, Reason} ->
+                                       error(Reason)
+                               end,
+                    {publish_limit, PubLimit};
+               ("force_gc_policy", Val) ->
+                    [Count, Bytes] = string:tokens(Val, "| "),
+                    GcPolicy = case cuttlefish_bytesize:parse(Bytes) of
+                                   {error, Reason} ->
+                                       error(Reason);
+                                   Bytes1 ->
+                                       #{bytes => Bytes1,
+                                         count => list_to_integer(Count)}
+                               end,
+                    {force_gc_policy, GcPolicy};
+               ("force_shutdown_policy", Val) ->
+                    [Len, Siz] = string:tokens(Val, "| "),
+                    ShutdownPolicy = case cuttlefish_bytesize:parse(Siz) of
+                                         {error, Reason} ->
+                                             error(Reason);
+                                         Siz1 ->
+                                             #{message_queue_len => list_to_integer(Len),
+                                               max_heap_size => Siz1}
+                                     end,
+                    {force_shutdown_policy, ShutdownPolicy};
                (Opt, Val) ->
                     {list_to_atom(Opt), Val}
             end,
@@ -1454,12 +1504,7 @@ end}.
 %%--------------------------------------------------------------------
 %% Bridges
 %%--------------------------------------------------------------------
-
-{mapping, "bridge.$name.type", "emqx.bridges", [
-  {datatype, {enum, [in, out]}}
-]}.
-
-{mapping, "bridge.$name.store_type", "emqx.bridges", [
+{mapping, "bridge.$name.mqueue_type", "emqx.bridges", [
   {datatype, {enum, [memory, disk]}}
 ]}.
 
@@ -1468,7 +1513,7 @@ end}.
 ]}.
 
 {mapping, "bridge.$name.proto_ver", "emqx.bridges", [
-  {datatype, {enum, [mqtt3, mqtt4, mqtt5]}}
+  {datatype, {enum, [mqttv3, mqttv4, mqttv5]}}
 ]}.
 
 {mapping, "bridge.$name.client_id", "emqx.bridges", [
@@ -1492,7 +1537,7 @@ end}.
   {datatype, string}
 ]}.
 
-{mapping, "bridge.$name.forward_rule", "emqx.bridges", [
+{mapping, "bridge.$name.forwards", "emqx.bridges", [
   {datatype, string}
 ]}.
 
@@ -1539,12 +1584,7 @@ end}.
   {default, auto}
 ]}.
 
-{mapping, "bridge.$name.reconnect_count", "emqx.bridges", [
-  {default, 10},
-  {datatype, integer}
-]}.
-
-{mapping, "bridge.$name.reconnect_time", "emqx.bridges", [
+{mapping, "bridge.$name.reconnect_interval", "emqx.bridges", [
   {default, "30s"},
   {datatype, {duration, s}}
 ]}.
@@ -1698,9 +1738,16 @@ end}.
   {datatype, {enum, [local,one,quorum,all]}}
 ]}.
 
+%% @doc Shared Subscription Dispatch Strategy.
 {mapping, "broker.shared_subscription_strategy", "emqx.shared_subscription_strategy", [
-  {default, random},
-  {datatype, {enum, [random, round_robbin, hash]}}
+  {default, round_robbin},
+  {datatype,
+   {enum,
+    [random, %% randomly pick a subscriber
+     round_robbin, %% round robin alive subscribers one message after another
+     sticky, %% pick a random subscriber and stick to it
+     hash %% hash client ID to a group member
+    ]}}
 ]}.
 
 {mapping, "broker.route_batch_clean", "emqx.route_batch_clean", [
@@ -1750,3 +1797,4 @@ end}.
    {busy_port, cuttlefish:conf_get("sysmon.busy_port", Conf)},
    {busy_dist_port, cuttlefish:conf_get("sysmon.busy_dist_port", Conf)}]
 end}.
+
