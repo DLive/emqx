@@ -631,8 +631,8 @@ handle_info(Info, State) ->
     emqx_logger:error("[Session] unexpected info: ~p", [Info]),
     {noreply, State}.
 
-terminate(Reason, #state{client_id = ClientId, conn_pid = ConnPid}) ->
-    emqx_hooks:run('session.terminated', [#{client_id => ClientId}, Reason]),
+terminate(Reason, #state{client_id = ClientId,username = Username, conn_pid = ConnPid}) ->
+    emqx_hooks:run('session.terminated', [#{client_id => ClientId,username => Username}, Reason]),
     %% Ensure to shutdown the connection
     if
         ConnPid =/= undefined ->
