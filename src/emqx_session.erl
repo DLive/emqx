@@ -516,7 +516,8 @@ handle_cast({resume, ConnPid}, State = #state{client_id       = ClientId,
                                               clean_start     = CleanStart,
                                               retry_timer     = RetryTimer,
                                               await_rel_timer = AwaitTimer,
-                                              expiry_timer    = ExpireTimer}) ->
+                                              expiry_timer    = ExpireTimer,
+                                              mqueue          = Mqueue}) ->
 
     ?LOG(info, "Resumed by connection ~p ", [ConnPid], State),
 
@@ -530,6 +531,8 @@ handle_cast({resume, ConnPid}, State = #state{client_id       = ClientId,
 
     true = link(ConnPid),
 
+    {ok,Mqueue1} = emqx_hooks:run('session.mqueue_check',[#{client_id => ClientId}],Mqueue),
+
     State1 = State#state{conn_pid        = ConnPid,
                          binding         = binding(ConnPid),
                          old_conn_pid    = OldConnPid,
@@ -537,13 +540,13 @@ handle_cast({resume, ConnPid}, State = #state{client_id       = ClientId,
                          retry_timer     = undefined,
                          awaiting_rel    = #{},
                          await_rel_timer = undefined,
-                         expiry_timer    = undefined},
+                         expiry_timer    = undefined,
+                         mqueue          = Mqueue1},
 
     %% Clean Session: true -> false???
     CleanStart andalso emqx_sm:set_session_attrs(ClientId, attrs(State1)),
 
     emqx_hooks:run('session.resumed', [#{client_id => ClientId}, attrs(State)]),
-
     %% Replay delivery and Dequeue pending messages
     noreply(dequeue(retry_delivery(true, State1)));
 
