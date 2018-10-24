@@ -517,6 +517,7 @@ handle_cast({resume, ConnPid}, State = #state{client_id       = ClientId,
                                               retry_timer     = RetryTimer,
                                               await_rel_timer = AwaitTimer,
                                               expiry_timer    = ExpireTimer,
+                                              inflight        = InFlight,
                                               mqueue          = Mqueue}) ->
 
     ?LOG(info, "Resumed by connection ~p ", [ConnPid], State),
@@ -531,7 +532,7 @@ handle_cast({resume, ConnPid}, State = #state{client_id       = ClientId,
 
     true = link(ConnPid),
 
-    {ok,Mqueue1} = emqx_hooks:run('session.mqueue_check',[#{client_id => ClientId}],Mqueue),
+    {ok,{Mqueue1,InFlight1}} = emqx_hooks:run('session.mqueue_check',[#{client_id => ClientId}],{Mqueue,InFlight}),
 
     State1 = State#state{conn_pid        = ConnPid,
                          binding         = binding(ConnPid),
@@ -541,8 +542,8 @@ handle_cast({resume, ConnPid}, State = #state{client_id       = ClientId,
                          awaiting_rel    = #{},
                          await_rel_timer = undefined,
                          expiry_timer    = undefined,
+                         inflight        = InFlight1,
                          mqueue          = Mqueue1},
-
     %% Clean Session: true -> false???
     CleanStart andalso emqx_sm:set_session_attrs(ClientId, attrs(State1)),
 
